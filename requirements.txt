@@ -1,20 +1,14 @@
 streamlit
-# Force the CPU version of PyTorch to save space & memory
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
-
-# Standard data science
 pandas
 numpy
 scikit-learn
 joblib
 matplotlib
-
-# Medical / AI Specific
 medmnist
 grad-cam
-
-# DiCE often causes conflicts, pinning versions helps
 dice-ml
-protobuf<=3.20.x
+protobuf<=3.20.3
+opencv-python-headless

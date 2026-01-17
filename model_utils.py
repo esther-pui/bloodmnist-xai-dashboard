@@ -1,6 +1,4 @@
 # model_utils.py
-# -*- coding: utf-8 -*-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,61 +8,48 @@ import pandas as pd
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 import joblib
+import medmnist
+from medmnist import INFO
 import dice_ml
 
 # -----------------------------
-# Device
+# 1. Dynamic Metadata (Colab Logic)
 # -----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# -----------------------------
-# BloodMNIST parameters
-# -----------------------------
-n_channels = 1
-label_names = [
-    'Neutrophil', 'Eosinophil', 'Basophil', 'Lymphocyte', 
-    'Monocyte', 'Immature Granulocyte', 'Red Blood Cell', 'Platelet'
-]
+data_flag = 'bloodmnist'
+info = INFO[data_flag]
+label_names = [info['label'][str(i)].replace('-', ' ').title() for i in range(len(info['label']))]
 n_classes = len(label_names)
+SIZE = 224 # From your Colab: SIZE = 224
 
 # -----------------------------
-# ResNet18 Model Definition
+# 2. Model Architecture (Exact Colab Classes)
 # -----------------------------
 class BasicBlock(nn.Module):
     expansion = 1
-
     def __init__(self, in_planes, planes, stride=1):
         super(BasicBlock, self).__init__()
-        self.conv1 = nn.Conv2d(
-            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
-
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
-                               stride=1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
-
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != self.expansion*planes:
             self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion*planes,
-                          kernel_size=1, stride=stride, bias=False),
+                nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(self.expansion*planes)
             )
-
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += self.shortcut(x)
-        out = F.relu(out)
-        return out
+        return F.relu(out)
 
 class ResNet(nn.Module):
     def __init__(self, block, num_blocks, in_channels=1, num_classes=8):
         super(ResNet, self).__init__()
         self.in_planes = 64
-
-        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3,
-                               stride=1, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
         self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
@@ -76,8 +61,8 @@ class ResNet(nn.Module):
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
+        for s in strides:
+            layers.append(block(self.in_planes, planes, s))
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
@@ -89,98 +74,139 @@ class ResNet(nn.Module):
         out = self.layer4(out)
         out = self.avgpool(out)
         out = out.view(out.size(0), -1)
-        out = self.linear(out)
-        return out
+        return self.linear(out)
 
-def ResNet18(in_channels=1, num_classes=8):
-    return ResNet(BasicBlock, [2, 2, 2, 2], in_channels=in_channels, num_classes=num_classes)
-
-# -----------------------------
-# Load pretrained ResNet18 model
-# -----------------------------
-model = ResNet18(in_channels=n_channels, num_classes=n_classes).to(device)
-model.load_state_dict(torch.load("bloodmnist_resnet18.pth", map_location=device))
-model.eval()
-
-# -----------------------------
-# PCA + PCAClassifier for DiCE
-# -----------------------------
-from sklearn.decomposition import PCA
+def ResNet18(in_channels=3, num_classes=8):
+    return ResNet(BasicBlock, [2, 2, 2, 2], in_channels, num_classes)
 
 class PCAClassifier(nn.Module):
     def __init__(self, input_dim, num_classes):
         super().__init__()
         self.fc = nn.Linear(input_dim, num_classes)
-
     def forward(self, x):
         return self.fc(x)
 
-# Load PCA and PCA classifier
-pca = joblib.load("pca_model.pkl")
+# -----------------------------
+# 3. Initialization & Loading
+# -----------------------------
+model = ResNet18(in_channels=3, num_classes=n_classes).to(device)
+model.load_state_dict(torch.load("assets/bloodmnist_resnet18.pth", map_location=device))
+model.eval()
+
+pca = joblib.load("assets/pca_model.pkl")
+
 pca_classifier = PCAClassifier(pca.n_components, n_classes).to(device)
-pca_classifier.load_state_dict(torch.load("pca_classifier.pth", map_location=device))
+pca_classifier.load_state_dict(torch.load("assets/pca_classifier.pth", map_location=device))
 pca_classifier.eval()
 
-# Wrap PCA classifier for DiCE
 class DiCEWrapper(nn.Module):
     def __init__(self, classifier):
         super().__init__()
         self.classifier = classifier
-
     def forward(self, x):
-        x = x.to(next(self.parameters()).device)
-        return self.classifier(x).cpu()
+        return self.classifier(x.to(device)).cpu()
 
-wrapped_model = DiCEWrapper(pca_classifier).to(device)
+wrapped_model = DiCEWrapper(pca_classifier)
 
 # -----------------------------
-# Image preprocessing
+# 4. Helpers (Colab Logic)
 # -----------------------------
-def preprocess_image(image, size=224):
+def preprocess_image(image):
+    """Adjusted to 3 channels to match your saved .pth weights"""
     transform = transforms.Compose([
-        transforms.Resize((size, size)),
+        transforms.Resize((SIZE, SIZE)),
+        transforms.Lambda(lambda x: x.convert("RGB")), # Ensure 3 channels
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5]*n_channels, std=[0.5]*n_channels)
+        transforms.Normalize(mean=[.5, .5, .5], std=[.5, .5, .5]) # 3 values
     ])
     return transform(image)
 
-# -----------------------------
-# Grad-CAM visualization
-# -----------------------------
 def get_gradcam_image(input_tensor, model):
-    model.eval()
     target_layers = [model.layer4[-1]]
     cam = GradCAM(model=model, target_layers=target_layers)
     grayscale_cam = cam(input_tensor=input_tensor)[0]
-
     img_np = input_tensor.cpu().numpy()[0].transpose(1, 2, 0)
     img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-    cam_image = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
-    return cam_image
+    # Note: show_cam_on_image expects RGB, it will handle the single channel
+    return show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
 
-# -----------------------------
-# DiCE counterfactuals
-# -----------------------------
-def get_counterfactuals_single(input_tensor, pca, pca_classifier, wrapped_model):
-    # Placeholder embedding (extract real embeddings for full dashboard)
+def get_counterfactuals_single(image):
+    # 1. Feature Extraction
+    input_tensor = preprocess_image(image).unsqueeze(0).to(device)
     with torch.no_grad():
-        embedding_pca = np.random.randn(1, pca.n_components)
+        x = F.relu(model.bn1(model.conv1(input_tensor)))
+        x = model.layer1(x)
+        x = model.layer2(x)
+        x = model.layer3(x)
+        x = model.layer4(x)
+        x = model.avgpool(x)
+        features_512 = x.view(x.size(0), -1).cpu().numpy()
 
-    df = pd.DataFrame(embedding_pca)
-    df['label'] = [0]  # placeholder
+    # 2. PCA & Prediction
+    embedding_pca = pca.transform(features_512)
+    feat_cols = [f"PC{i}" for i in range(pca.n_components)]
+    
+    # 3. Create the Query DataFrame
+    query_df = pd.DataFrame(embedding_pca, columns=feat_cols)
+    
+    with torch.no_grad():
+        logits = pca_classifier(torch.tensor(embedding_pca).float().to(device))
+        probs = F.softmax(logits, dim=1)
+        top_probs, top_idxs = torch.topk(probs, 2)
+        current_pred = top_idxs[0][0].item()
+        target_class = top_idxs[0][1].item()
 
-    continuous_features = df.columns[:-1].tolist()
-    d = dice_ml.Data(dataframe=df, continuous_features=continuous_features, outcome_name='label')
+    query_df['label'] = [current_pred]
+
+    # 4. CRITICAL FIX: Define a wide search range for DiCE
+    # We create a dummy dataframe with min (-10) and max (+10) values for every PC
+    # This tells DiCE it is allowed to search anywhere in this space.
+    min_row = {col: -20.0 for col in feat_cols}
+    max_row = {col: 20.0 for col in feat_cols}
+    min_row['label'] = 0
+    max_row['label'] = 1
+    
+    # Combine query with bounds to define the Data object
+    bounds_df = pd.DataFrame([min_row, max_row])
+    working_df = pd.concat([query_df, bounds_df], ignore_index=True)
+
+    d = dice_ml.Data(dataframe=working_df, continuous_features=feat_cols, outcome_name='label')
     m = dice_ml.Model(model=wrapped_model, backend="PYT")
-    exp = dice_ml.Dice(d, m, method="genetic")
+    exp = dice_ml.Dice(d, m, method="random")
 
-    query_instance = df.drop(columns=['label']).iloc[0:1]
-    cf = exp.generate_counterfactuals(query_instance, total_CFs=3, desired_class=1)
+    # 5. Generate Counterfactuals
+    query_instance = query_df.drop(columns=['label'])
+    
+    try:
+        dice_exp = exp.generate_counterfactuals(
+            query_instance, 
+            total_CFs=1, 
+            desired_class=int(target_class),
+            sample_size=200, 
+            random_seed=42
+        )
+    except:
+        # Fallback loop
+        dice_exp = None
+        for i in range(n_classes):
+            if i == current_pred: continue
+            try:
+                dice_exp = exp.generate_counterfactuals(
+                    query_instance, total_CFs=1, desired_class=int(i), sample_size=50
+                )
+                if dice_exp: break
+            except:
+                continue
 
-    cf_df = cf.cf_examples_list[0].final_cfs_df.copy()
-    cf_df['change_magnitude'] = cf_df.drop(columns=['label']).sub(query_instance.values[0]).abs().sum(axis=1)
-    cf_df = cf_df.sort_values('change_magnitude')
-    cf_transposed = cf_df.drop(columns=['change_magnitude']).transpose()
-    cf_transposed.columns = [f'CF{i+1}' for i in range(cf_transposed.shape[1])]
+    if dice_exp is None:
+        return None
 
-    return cf_df, cf_transposed
+    cf_df = dice_exp.cf_examples_list[0].final_cfs_df.copy()
+    
+    if cf_df.empty or cf_df.iloc[0]['label'] == current_pred:
+        return None
+
+    delta = cf_df.drop(columns=['label']).values - query_instance.values
+    cf_df['change_magnitude'] = np.linalg.norm(delta, axis=1)
+    
+    return cf_df

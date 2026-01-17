@@ -2,7 +2,7 @@
 venv/
 
 # Ignore assets folder
-assets/
+# assets/
 
 # macOS system files
 .DS_Store

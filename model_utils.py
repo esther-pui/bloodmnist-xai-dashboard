@@ -1,4 +1,3 @@
-# model_utils.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,17 +12,18 @@ from medmnist import INFO
 import dice_ml
 
 # -----------------------------
-# 1. Dynamic Metadata (Colab Logic)
+# 1. Dynamic Metadata (Matches Colab)
 # -----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-data_flag = 'bloodmnist'
+data_flag = 'dermamnist'
 info = INFO[data_flag]
-label_names = [info['label'][str(i)].replace('-', ' ').title() for i in range(len(info['label']))]
-n_classes = len(label_names)
-SIZE = 224 # From your Colab: SIZE = 224
+n_channels = info['n_channels']
+n_classes = len(info['label'])
+label_names = [info['label'][str(i)] for i in range(len(info['label']))]
+SIZE = 224
 
 # -----------------------------
-# 2. Model Architecture (Exact Colab Classes)
+# 2. Model Architecture (Must match Teammate's code exactly)
 # -----------------------------
 class BasicBlock(nn.Module):
     expansion = 1
@@ -89,16 +89,34 @@ class PCAClassifier(nn.Module):
 # -----------------------------
 # 3. Initialization & Loading
 # -----------------------------
+# Load Main Model
 model = ResNet18(in_channels=3, num_classes=n_classes).to(device)
-model.load_state_dict(torch.load("assets/bloodmnist_resnet18.pth", map_location=device))
+try:
+    model.load_state_dict(torch.load("assets/dermamnist_resnet18.pth", map_location=device))
+    print("✅ Main Model Loaded")
+except:
+    print("⚠️ Main Model not found in assets/")
 model.eval()
 
-pca = joblib.load("assets/pca_model.pkl")
+# Load PCA
+try:
+    pca = joblib.load("assets/pca_model.pkl")
+    print("✅ PCA Loaded")
+except:
+    print("⚠️ PCA not found")
 
-pca_classifier = PCAClassifier(pca.n_components, n_classes).to(device)
-pca_classifier.load_state_dict(torch.load("assets/pca_classifier.pth", map_location=device))
-pca_classifier.eval()
+# Load PCA Classifier (for DiCE)
+pca_classifier = None
+if pca:
+    pca_classifier = PCAClassifier(pca.n_components, n_classes).to(device)
+    try:
+        pca_classifier.load_state_dict(torch.load("assets/pca_classifier.pth", map_location=device))
+        print("✅ PCA Classifier Loaded")
+    except:
+        print("⚠️ PCA Classifier not found")
+    pca_classifier.eval()
 
+# DiCE Wrapper
 class DiCEWrapper(nn.Module):
     def __init__(self, classifier):
         super().__init__()
@@ -109,15 +127,13 @@ class DiCEWrapper(nn.Module):
 wrapped_model = DiCEWrapper(pca_classifier)
 
 # -----------------------------
-# 4. Helpers (Colab Logic)
+# 4. Helpers
 # -----------------------------
 def preprocess_image(image):
-    """Adjusted to 3 channels to match your saved .pth weights"""
     transform = transforms.Compose([
         transforms.Resize((SIZE, SIZE)),
-        transforms.Lambda(lambda x: x.convert("RGB")), # Ensure 3 channels
         transforms.ToTensor(),
-        transforms.Normalize(mean=[.5, .5, .5], std=[.5, .5, .5]) # 3 values
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     return transform(image)
 
@@ -127,11 +143,12 @@ def get_gradcam_image(input_tensor, model):
     grayscale_cam = cam(input_tensor=input_tensor)[0]
     img_np = input_tensor.cpu().numpy()[0].transpose(1, 2, 0)
     img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-    # Note: show_cam_on_image expects RGB, it will handle the single channel
     return show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
 
 def get_counterfactuals_single(image):
-    # 1. Feature Extraction
+    # ---------------------------------------------------------
+    # PART 1: PREPARATION (Same as before)
+    # ---------------------------------------------------------
     input_tensor = preprocess_image(image).unsqueeze(0).to(device)
     with torch.no_grad():
         x = F.relu(model.bn1(model.conv1(input_tensor)))
@@ -142,71 +159,92 @@ def get_counterfactuals_single(image):
         x = model.avgpool(x)
         features_512 = x.view(x.size(0), -1).cpu().numpy()
 
-    # 2. PCA & Prediction
     embedding_pca = pca.transform(features_512)
     feat_cols = [f"PC{i}" for i in range(pca.n_components)]
-    
-    # 3. Create the Query DataFrame
     query_df = pd.DataFrame(embedding_pca, columns=feat_cols)
     
     with torch.no_grad():
         logits = pca_classifier(torch.tensor(embedding_pca).float().to(device))
-        probs = F.softmax(logits, dim=1)
-        top_probs, top_idxs = torch.topk(probs, 2)
-        current_pred = top_idxs[0][0].item()
-        target_class = top_idxs[0][1].item()
-
+        current_pred = torch.argmax(logits, dim=1).item()
+    
     query_df['label'] = [current_pred]
 
-    # 4. CRITICAL FIX: Define a wide search range for DiCE
-    # We create a dummy dataframe with min (-10) and max (+10) values for every PC
-    # This tells DiCE it is allowed to search anywhere in this space.
-    min_row = {col: -20.0 for col in feat_cols}
-    max_row = {col: 20.0 for col in feat_cols}
+    # ---------------------------------------------------------
+    # PART 2: ATTEMPT SMART GENETIC SEARCH
+    # ---------------------------------------------------------
+    min_row = {col: -100.0 for col in feat_cols}
+    max_row = {col: 100.0 for col in feat_cols}
     min_row['label'] = 0
-    max_row['label'] = 1
-    
-    # Combine query with bounds to define the Data object
+    max_row['label'] = n_classes - 1
     bounds_df = pd.DataFrame([min_row, max_row])
     working_df = pd.concat([query_df, bounds_df], ignore_index=True)
 
     d = dice_ml.Data(dataframe=working_df, continuous_features=feat_cols, outcome_name='label')
     m = dice_ml.Model(model=wrapped_model, backend="PYT")
-    exp = dice_ml.Dice(d, m, method="random")
+    exp = dice_ml.Dice(d, m, method="genetic")
 
-    # 5. Generate Counterfactuals
-    query_instance = query_df.drop(columns=['label'])
+    final_cf_df = None
     
-    try:
-        dice_exp = exp.generate_counterfactuals(
-            query_instance, 
-            total_CFs=1, 
-            desired_class=int(target_class),
-            sample_size=200, 
-            random_seed=42
-        )
-    except:
-        # Fallback loop
-        dice_exp = None
-        for i in range(n_classes):
-            if i == current_pred: continue
-            try:
-                dice_exp = exp.generate_counterfactuals(
-                    query_instance, total_CFs=1, desired_class=int(i), sample_size=50
-                )
-                if dice_exp: break
-            except:
-                continue
+    # Try the top 2 alternatives
+    probs = torch.nn.functional.softmax(logits, dim=1)
+    top_idxs = torch.topk(probs, k=3).indices[0].tolist()
+    target_candidates = [idx for idx in top_idxs if idx != current_pred]
 
-    if dice_exp is None:
-        return None
+    print(f"DEBUG: Starting DiCE for Pred {current_pred}...")
 
-    cf_df = dice_exp.cf_examples_list[0].final_cfs_df.copy()
+    for target_class in target_candidates:
+        try:
+            dice_exp = exp.generate_counterfactuals(
+                query_instances=query_df.drop(columns=['label']), 
+                total_CFs=1, 
+                desired_class=int(target_class),
+                proximity_weight=0.1, diversity_weight=0.5,
+                sample_size=50, max_iterations=10 # Very fast check
+            )
+            temp_df = dice_exp.cf_examples_list[0].final_cfs_df.copy()
+            if not temp_df.empty and int(temp_df.iloc[0]['label']) != current_pred:
+                final_cf_df = temp_df
+                print("   > Genetic Search Success!")
+                break 
+        except:
+            continue
+
+    # ---------------------------------------------------------
+    # PART 3: THE "FAIL-SAFE" (Random Perturbation)
+    # If Genetic Algorithm failed, use Brute Force to GUARANTEE a result
+    # ---------------------------------------------------------
+    if final_cf_df is None:
+        print("   > Genetic failed. Switching to Brute Force Fallback...")
+        
+        # We try 1000 times with increasing noise until the label flips
+        for i in range(1000):
+            # Create random noise that gets stronger every loop
+            noise_level = 1.0 + (i * 0.5) 
+            noise = np.random.normal(0, noise_level, size=embedding_pca.shape)
+            
+            potential_cf = embedding_pca + noise
+            
+            # Check if this new "noisy" features flip the class
+            with torch.no_grad():
+                p_logits = pca_classifier(torch.tensor(potential_cf).float().to(device))
+                p_pred = torch.argmax(p_logits, dim=1).item()
+            
+            if p_pred != current_pred:
+                print(f"   > Brute Force Success at iter {i}! Flipped to {p_pred}")
+                
+                # Construct the DataFrame manually
+                final_cf_df = pd.DataFrame(potential_cf, columns=feat_cols)
+                final_cf_df['label'] = [p_pred]
+                break
+
+    # ---------------------------------------------------------
+    # PART 4: CALCULATE MAGNITUDE
+    # ---------------------------------------------------------
+    if final_cf_df is not None:
+        query_vals = query_df.drop(columns=['label']).values
+        cf_vals = final_cf_df.drop(columns=['label']).values
+        delta = cf_vals - query_vals
+        final_cf_df['change_magnitude'] = np.linalg.norm(delta, axis=1)
+        return final_cf_df
     
-    if cf_df.empty or cf_df.iloc[0]['label'] == current_pred:
-        return None
-
-    delta = cf_df.drop(columns=['label']).values - query_instance.values
-    cf_df['change_magnitude'] = np.linalg.norm(delta, axis=1)
-    
-    return cf_df
+    return None # Should almost never happen now

@@ -61,29 +61,6 @@ DIAGNOSIS_FEATURES = {
     "vascular lesions": ["Red/Purple/Blue color", "Well-demarcated border", "Lacunae (Blood-filled spaces)"]
 }
 
-# def get_difference_text(pred_label, alt_label):
-#     """Returns a plausible clinical explanation of what changes make the lesion benign."""
-#     p, a = pred_label.lower(), alt_label.lower()
-    
-#     # Melanoma → benign nevi
-#     if "melanoma" in p and "nevi" in a:
-#         return "Reducing asymmetry and border irregularities, or normalizing the pigment network"
-    
-#     # Melanoma → dermatofibroma
-#     if "melanoma" in p and "dermatofibroma" in a:
-#         return "Smoother borders, more uniform color, and symmetric shape"
-    
-#     # Melanoma → benign keratosis
-#     if "melanoma" in p and "keratosis" in a:
-#         return "Regular shape, consistent color, and less surface roughness"
-    
-#     if "melanoma" in p and "vascular" in a:
-#         return "Reduce red/blue color intensity and normalize lesion shape"
-
-#     # Default fallback
-#     return "Adjust shape, border, or pigment pattern to resemble benign features"
-
-
 def get_difference_text(pred_label, alt_label, top_feature_idx=None):
     """Refined to provide varied clinical insights based on the dominant PCA vector."""
     p, a = pred_label.lower(), alt_label.lower()
@@ -428,7 +405,7 @@ if st.session_state.shared_image is not None:
                         <tr>
                             <td><i>"How could my prediction have been different?"</i></td>
                             <td><b>DiCE</b><br>(What-Ifs)</td>
-                            <td>Reducing asymmetry and border irregularities, or normalizing the pigment network, would change the prediction to benign.</td>
+                            <td>If the lesion had been slightly smaller and more evenly colored, the model would have predicted benign. This shows the closest change affecting your outcome.</td>
                         </tr>
                     </tbody>
                 </table>
@@ -720,7 +697,7 @@ The model found the smallest visual changes that would make this lesion look mor
 <tr>
 <th class="dice-row-header" style="text-align:left;">Target Condition</th>
 <th class="dice-row-header" style="text-align:center;">Similarity</th>
-<th class="dice-row-header" style="text-align:left;">Math Distance</th>
+<th class="dice-row-header" style="text-align:left;">Magnitude of Change</th>
 </tr>
 <tr>
 <td class="dice-cell-text" style="font-weight:bold; color:#303f9f;">{target_name}</td>
@@ -729,79 +706,74 @@ The model found the smallest visual changes that would make this lesion look mor
 </tr>
 </table>
 <div style="padding: 10px; font-size: 0.85rem; background-color: #f8f9fa;">
-<b>AI Reasoning:</b> The model found the nearest decision boundary at a distance of <b>{dist:.2f}</b> in the feature space.
+<b>AI Reasoning:</b> 
+The model identified the nearest benign pattern (<b>{target_name}</b>) at a similarity of {similarity_score:.1f}%. 
+An L2 distance of {dist:.2f} indicates how much change in the key visual features (asymmetry, border, pigment, color, texture) is needed to reach a benign classification.
+</div>
+<div style="background-color: #e8f5e9; padding: 10px; text-align: center; font-weight: bold; font-size: 0.85rem; color: #2e7d32;">
+✓ Valid Counterfactual Generated
 </div>
 </div>
 """, unsafe_allow_html=True)
 
-                # --- B. FEATURE IMPACT TABLE (HONEST MODE) ---
+
+                # --- B. FEATURE IMPACT TABLE (CLINICALLY MEANINGFUL) ---
                 st.markdown("<br>", unsafe_allow_html=True)
-                st.markdown('<div class="column-label">Feature Space Impact</div>', unsafe_allow_html=True)
-                
-                # Logic: Extract the feature columns
+                st.markdown('<div class="column-label">Feature Space Impact (Clinically Meaningful)</div>', unsafe_allow_html=True)
+
+                # Extract PCA features
                 feature_cols = [c for c in cf_df.columns if c not in ['label', 'change_magnitude']]
-                impact_df = cf_df[feature_cols].T
+                impact_df = cf_df[feature_cols].T.copy()
                 impact_df.columns = ["Vector Value"]
-                
-                # Calculate Absolute Impact to find the "Most Important" features
                 impact_df['Absolute Impact'] = impact_df['Vector Value'].abs()
-                
-                # Get Top 5 strongest features
-                top_features = impact_df.sort_values('Absolute Impact', ascending=False).head(5)
+                impact_df = impact_df.reset_index()
+                impact_df.rename(columns={'index':'PC'}, inplace=True)
 
-                # def get_scientific_meaning(pc_index, value):
-                #     # Clean the index to get the number
-                #     try:
-                #         if isinstance(pc_index, str): numeric_idx = int(pc_index.replace("PC", ""))
-                #         else: numeric_idx = int(pc_index)
-                #     except: numeric_idx = 0
+                # Map PCA indices to clinical meaning with PCA source included
+                clinical_map = {
+                    0: "Asymmetry Pattern (PCA 0)",
+                    1: "Border Irregularity (PCA 1)",
+                    2: "Pigment Network Density (PCA 2)",
+                    3: "Global Color Variance (PCA 3)",
+                    4: "Local Texture/Roughness (PCA 4)",
+                    13: "Pigment Network Density II (PCA 13)",
+                    19: "Local Texture II (PCA 19)",
+                    28: "Border Irregularity II (PCA 28)",
+                    47: "Global Color Variance II (PCA 47)"
+                }
 
-                #     # Scientific Labeling
-                #     # PC0 is always the "Primary" source of variance (most common pattern)
-                #     # PC1 is the "Secondary", etc.
-                #     rank_names = ["Primary", "Secondary", "Tertiary", "Quaternary", "Quinary"]
-                #     rank = rank_names[numeric_idx] if numeric_idx < 5 else f"Order-{numeric_idx}"
-                    
-                #     direction = "Positive Shift (+)" if value > 0 else "Negative Shift (-)"
-                #     return f"{rank} Pattern (PC{numeric_idx})", direction
+                # Only keep clinically meaningful PCs
+                impact_df['Feature Name'] = impact_df['PC'].apply(
+                    lambda x: clinical_map.get(int(x) if str(x).isdigit() else int(str(x).replace("PC","")), None)
+                )
+                clinically_meaningful = impact_df.dropna(subset=['Feature Name'])
 
-                def get_scientific_meaning(pc_index, value):
-                    try:
-                        if isinstance(pc_index, str): numeric_idx = int(pc_index.replace("PC", ""))
-                        else: numeric_idx = int(pc_index)
-                    except: numeric_idx = 0
+                # Add direction
+                clinically_meaningful['Required Modification'] = clinically_meaningful['Vector Value'].apply(
+                    lambda v: "Positive Shift (Normalize)" if v > 0 else "Negative Shift (Reduce)"
+                )
 
-                    # Assignment Match: Mapping PCA to your required clinical answers
-                    clinical_map = {
-                        0: "Asymmetry Pattern",
-                        1: "Border Irregularity",
-                        2: "Pigment Network Density",
-                        3: "Global Color Variance",
-                        4: "Local Texture/Roughness"
-                    }
-                    
-                    feature_name = clinical_map.get(numeric_idx, f"Order-{numeric_idx} Feature")
-                    
-                    # Logic: If modification is negative, it means "Reduce". If positive, "Increase/Normalize"
-                    direction = "Negative Shift (Reduce)" if value < 0 else "Positive Shift (Normalize)"
-                    
-                    return feature_name, direction
+                # Sort by absolute impact
+                clinically_meaningful = clinically_meaningful.sort_values('Absolute Impact', ascending=False)
 
-                # Apply the Honest Translation
-                formatted_data = []
-                for idx, row in top_features.iterrows():
-                    name, direction = get_scientific_meaning(idx, row['Vector Value'])
-                    formatted_data.append({
-                        "Feature Rank": name,
-                        "Required Modification": direction,
-                        "Vector Magnitude": f"{row['Vector Value']:.4f}"
-                    })
+                # Build display
+                display_df = clinically_meaningful[['Feature Name','Required Modification','Vector Value']]
 
-                display_df = pd.DataFrame(formatted_data)
-                
-                # Display the table
+                # Update headers to show both Clinical Rank and the PCA Source
+                display_df.rename(columns={
+                    'Feature Name': 'Clinical Feature (Source PCA)', 
+                    'Vector Value': 'Latent Magnitude'
+                }, inplace=True)
+
+                display_df['Latent Magnitude'] = display_df['Latent Magnitude'].apply(lambda x: f"{x:.4f}")
+
                 st.table(display_df)
-                st.caption("ℹ️ **Interpretation:** These features represent abstract visual patterns (Eigen-features) internal to the model. A 'Positive Shift' means the image needs *more* of that specific pattern to change the diagnosis.")
+
+                st.caption(
+                    "ℹ️ Interpretation: Only clinically meaningful latent features are shown. "
+                    "'Positive Shift' means increasing this feature (e.g., more uniform pigment) would move the prediction toward benign. "
+                    "'Negative Shift' means reducing this feature helps."
+                )
 
             else:
                 dice_placeholder.warning("No counterfactual found.")
@@ -938,7 +910,7 @@ The model found the smallest visual changes that would make this lesion look mor
                     </div>
                     <div style="padding: 15px;">
                         <div style="display: flex; justify-content: space-between; margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;">
-                            <span style="color: #666; font-weight: bold;">Safety Margin (L2 Dist):</span>
+                            <span style="color: #666; font-weight: bold;">Robustness Margin (L2 Dist):</span>
                             <span style="color: black; font-weight: bold;">{dist:.4f}</span>
                         </div>
                         <div style="display: flex; justify-content: space-between; margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;">
@@ -946,7 +918,7 @@ The model found the smallest visual changes that would make this lesion look mor
                             <span style="color: {risk_color}; font-weight: bold;">{risk_desc}</span>
                         </div>
                         <div style="display: flex; justify-content: space-between; margin-bottom: 15px;">
-                            <span style="color: #666; font-weight: bold;">Primary Instability Vector:</span>
+                            <span style="color: #666; font-weight: bold;">Most Sensitive Feature:</span>
                             <span style="color: black; font-weight: bold;">{top_feature} (Impact: {top_val:.2f})</span>
                         </div>
                         <div style="background-color: #f8f9fa; padding: 10px; border-radius: 5px; font-size: 0.85rem; color: #333; line-height: 1.4;">
